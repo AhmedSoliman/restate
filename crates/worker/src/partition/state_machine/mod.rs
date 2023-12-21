@@ -107,7 +107,7 @@ mod tests {
     };
     use restate_types::invocation::{
         InvocationResponse, InvocationTermination, MaybeFullInvocationId, ResponseResult,
-        ServiceInvocation, ServiceInvocationResponseSink, ServiceInvocationSpanContext,
+        ServiceInvocation, ServiceInvocationResponseSink, Source,
     };
     use restate_types::journal::enriched::EnrichedRawEntry;
     use restate_types::journal::{Completion, CompletionResult};
@@ -432,14 +432,10 @@ mod tests {
             let mut t = state_machine.storage().transaction();
             t.put_invocation_status(
                 &notification_service_service_id,
-                InvocationStatus::Invoked(InvocationMetadata::new(
-                    fid_virtual_invocation_creator.invocation_uuid,
-                    JournalMetadata::new(0, ServiceInvocationSpanContext::empty()),
-                    None,
-                    ByteString::from_static("OtherMethod"),
-                    None,
-                    StatusTimestamps::now(),
-                )),
+                InvocationStatus::Invoked(InvocationMetadata {
+                    invocation_uuid: fid_virtual_invocation_creator.invocation_uuid,
+                    ..InvocationMetadata::mock()
+                }),
             )
             .await;
             t.commit().await.unwrap();
@@ -533,14 +529,10 @@ mod tests {
             .await;
             t.put_invocation_status(
                 &notification_service_service_id,
-                InvocationStatus::Invoked(InvocationMetadata::new(
-                    fid_virtual_invocation_creator.invocation_uuid,
-                    JournalMetadata::new(0, ServiceInvocationSpanContext::empty()),
-                    None,
-                    ByteString::from_static("OtherMethod"),
-                    None,
-                    StatusTimestamps::now(),
-                )),
+                InvocationStatus::Invoked(InvocationMetadata {
+                    invocation_uuid: fid_virtual_invocation_creator.invocation_uuid,
+                    ..InvocationMetadata::mock()
+                }),
             )
             .await;
             t.commit().await.unwrap();
@@ -641,6 +633,7 @@ mod tests {
                 fid: fid.clone(),
                 method_name: ByteString::from("MyMethod"),
                 argument: Default::default(),
+                source: Source::Ingress,
                 response_sink: None,
                 span_context: Default::default(),
             })))
