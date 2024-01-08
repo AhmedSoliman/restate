@@ -20,19 +20,20 @@ pub mod scan;
 pub mod state_table;
 pub mod status_table;
 pub mod timer_table;
+mod writer;
 
 use crate::codec::Codec;
 use crate::keys::TableKey;
 use crate::scan::{PhysicalScan, TableScan};
+use crate::writer::{Writer, WriterHandle};
 use crate::TableKind::{
     Deduplication, Inbox, Journal, Outbox, PartitionStateMachine, State, Status, Timers,
 };
 use bytes::BytesMut;
 use codederror::CodedError;
 use futures::{ready, FutureExt, Stream};
-use futures_util::future::{ok, ready};
-use futures_util::{stream, StreamExt};
-use restate_storage_api::{GetFuture, GetStream, PutFuture, Storage, StorageError, Transaction};
+use futures_util::stream;
+use restate_storage_api::{Storage, StorageError, Transaction};
 use rocksdb::BlockBasedOptions;
 use rocksdb::Cache;
 use rocksdb::ColumnFamily;
@@ -47,9 +48,11 @@ use rocksdb::WriteBatch;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot::Sender;
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
+
+pub use writer::JoinHandle as RocksDBWriterJoinHandle;
+pub use writer::Writer as RocksDBWriter;
 
 type DB = rocksdb::DBWithThreadMode<SingleThreaded>;
 pub type DBIterator<'b> = DBRawIteratorWithThreadMode<'b, DB>;
@@ -146,7 +149,7 @@ impl Default for Options {
 }
 
 impl Options {
-    pub fn build(self) -> std::result::Result<RocksDBStorage, BuildError> {
+    pub fn build(self) -> std::result::Result<(RocksDBStorage, Writer), BuildError> {
         RocksDBStorage::new(self)
     }
 }
@@ -178,7 +181,7 @@ impl BuildError {
 #[derive(Clone, Debug)]
 pub struct RocksDBStorage {
     db: Arc<DB>,
-    tx: UnboundedSender<(WriteBatch, Sender<std::result::Result<(), StorageError>>)>,
+    writer_handle: WriterHandle,
 }
 
 fn db_options(opts: &Options) -> rocksdb::Options {
@@ -283,7 +286,7 @@ fn cf_options(opts: &Options, cache: Option<Cache>) -> rocksdb::Options {
 }
 
 impl RocksDBStorage {
-    fn new(opts: Options) -> std::result::Result<Self, BuildError> {
+    fn new(opts: Options) -> std::result::Result<(Self, Writer), BuildError> {
         let cache = if opts.cache_size > 0 {
             Some(Cache::new_lru_cache(opts.cache_size))
         } else {
@@ -323,15 +326,17 @@ impl RocksDBStorage {
             .map_err(BuildError::from_rocksdb_error)?;
         let rdb = Arc::new(rdb);
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(
-            WriteBatch,
-            Sender<std::result::Result<(), StorageError>>,
-        )>();
-
         let rdb2 = Clone::clone(&rdb);
-        tokio::task::spawn_blocking(move || commit_loop(rdb2, rx));
+        let writer = Writer::new(rdb2);
+        let writer_handle = writer.create_writer_handle();
 
-        Ok(Self { db: rdb, tx })
+        Ok((
+            Self {
+                db: rdb,
+                writer_handle,
+            },
+            writer,
+        ))
     }
 
     #[inline]
@@ -410,16 +415,7 @@ impl RocksDBStorage {
         &self,
         write_batch: WriteBatch,
     ) -> std::result::Result<(), StorageError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        self.tx
-            .send((write_batch, tx))
-            .map_err(|_| StorageError::OperationalError)?;
-
-        match rx.await {
-            Err(_) => Err(StorageError::OperationalError),
-            Ok(res) => res,
-        }
+        self.writer_handle.write(write_batch).await
     }
 }
 
@@ -476,7 +472,7 @@ impl<T: Send + 'static> Stream for BackgroundScanStream<T> {
 }
 
 impl<'a> RocksDBTransaction<'a> {
-    pub fn get_blocking<K, F, R>(&mut self, key: K, f: F) -> GetFuture<'static, R>
+    pub async fn get_blocking<K, F, R>(&mut self, key: K, f: F) -> Result<R>
     where
         K: TableKey + Send + 'static,
         F: FnOnce(&[u8], Option<&[u8]>) -> Result<R> + Send + 'static,
@@ -486,27 +482,24 @@ impl<'a> RocksDBTransaction<'a> {
         key.serialize_to(&mut buf);
         let buf = buf.split();
 
-        let res = match self.storage.get(K::table(), &buf) {
+        match self.storage.get(K::table(), &buf) {
             Ok(value) => {
                 let slice = value.as_ref().map(|v| v.as_ref());
                 f(&buf, slice)
             }
             Err(err) => Err(err),
-        };
-
-        ready(res).boxed()
+        }
     }
 
     #[inline]
-    pub fn get_first_blocking<K, F, R>(&mut self, scan: TableScan<K>, f: F) -> GetFuture<'static, R>
+    pub async fn get_first_blocking<K, F, R>(&mut self, scan: TableScan<K>, f: F) -> Result<R>
     where
         K: TableKey + Send + 'static,
         F: FnOnce(Option<(&[u8], &[u8])>) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
         let iterator = self.storage.iterator_from(scan);
-        let result = f(iterator.item());
-        ready(result).boxed()
+        f(iterator.item())
     }
 
     #[inline]
@@ -514,7 +507,7 @@ impl<'a> RocksDBTransaction<'a> {
         &self,
         scan: TableScan<K>,
         mut op: F,
-    ) -> GetStream<'static, R>
+    ) -> impl Stream<Item = Result<R>> + Send
     where
         K: TableKey + Send + 'static,
         F: FnMut(&[u8], &[u8]) -> TableScanIterationDecision<R> + Send + 'static,
@@ -543,14 +536,14 @@ impl<'a> RocksDBTransaction<'a> {
             };
         }
 
-        stream::iter(res).boxed()
+        stream::iter(res)
     }
 
     pub fn for_each_key_value<K, F, R>(
         &self,
         scan: TableScan<K>,
         mut op: F,
-    ) -> GetStream<'static, R>
+    ) -> impl Stream<Item = Result<R>> + Send
     where
         K: TableKey + Send + 'static,
         F: FnMut(&[u8], &[u8]) -> TableScanIterationDecision<R> + Send + 'static,
@@ -585,7 +578,7 @@ impl<'a> RocksDBTransaction<'a> {
         };
 
         let join_handle = tokio::task::spawn_blocking(background_task);
-        BackgroundScanStream::new(rx, join_handle).boxed()
+        BackgroundScanStream::new(rx, join_handle)
     }
 
     #[inline]
@@ -641,72 +634,12 @@ impl<'a> RocksDBTransaction<'a> {
 }
 
 impl<'a> Transaction for RocksDBTransaction<'a> {
-    fn commit<'b>(self) -> GetFuture<'b, ()>
-    where
-        Self: 'b,
-    {
+    async fn commit(self) -> Result<()> {
         if self.write_batch.is_none() {
-            return ok(()).boxed();
+            return Ok(());
         }
+
         let write_batch = self.write_batch.unwrap();
-        self.storage.commit_write_batch(write_batch).boxed()
-    }
-}
-
-fn try_write_batch(
-    db: &Arc<DB>,
-    futures: &mut Vec<Sender<std::result::Result<(), StorageError>>>,
-    batch: WriteBatch,
-) -> bool {
-    let result = db
-        .write(batch)
-        .map_err(|error| StorageError::Generic(error.into()));
-    if result.is_ok() {
-        return true;
-    }
-    //
-    // oops one of the batches failed, notify the others.
-    //
-    debug_assert!(!futures.is_empty());
-    let last = futures.len() - 1;
-    for f in futures.drain(..last) {
-        let _ = f.send(Err(StorageError::OperationalError));
-    }
-    let oneshot = futures.drain(..).last().unwrap();
-    let _ = oneshot.send(result);
-    false
-}
-
-fn commit_loop(
-    db: Arc<DB>,
-    mut rx: UnboundedReceiver<(WriteBatch, Sender<std::result::Result<(), StorageError>>)>,
-) {
-    let mut replies: Vec<Sender<std::result::Result<(), StorageError>>> = Vec::new();
-    'out: while let Some((batch, reply)) = rx.blocking_recv() {
-        replies.push(reply);
-        if !try_write_batch(&db, &mut replies, batch) {
-            continue;
-        }
-        //
-        // optimistically try taking more batches
-        //
-        while let Ok((batch, reply)) = rx.try_recv() {
-            replies.push(reply);
-            if !try_write_batch(&db, &mut replies, batch) {
-                continue 'out;
-            }
-        }
-        //
-        // okay now that we wrote everything, let us commit
-        //
-        db.flush_wal(true)
-            .map_err(|error| StorageError::Generic(error.into()))
-            .expect("Unable to flush the WAL");
-        //
-        // notify everyone of the success
-        //
-        replies.drain(..).for_each(|f| {
-            let _ = f.send(Ok(()));
-        });
+        self.storage.commit_write_batch(write_batch).await
     }
 }

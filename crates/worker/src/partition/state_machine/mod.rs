@@ -130,6 +130,8 @@ mod tests {
         //  Perhaps we could make these tests faster by having those.
         rocksdb_storage: RocksDBStorage,
         effects_buffer: Effects,
+        signal: drain::Signal,
+        writer_join_handle: restate_storage_rocksdb::RocksDBWriterJoinHandle,
     }
 
     impl Default for MockStateMachine {
@@ -146,15 +148,22 @@ mod tests {
         pub fn new(inbox_seq_number: MessageIndex, outbox_seq_number: MessageIndex) -> Self {
             let temp_dir = tempdir().unwrap();
             info!("Using RocksDB temp directory {}", temp_dir.path().display());
+            let (rocksdb_storage, writer) = restate_storage_rocksdb::OptionsBuilder::default()
+                .path(temp_dir.into_path().to_str().unwrap().to_string())
+                .build()
+                .unwrap()
+                .build()
+                .unwrap();
+
+            let (signal, watch) = drain::channel();
+            let writer_join_handle = writer.run(watch);
+
             Self {
                 state_machine: StateMachine::new(inbox_seq_number, outbox_seq_number),
-                rocksdb_storage: restate_storage_rocksdb::OptionsBuilder::default()
-                    .path(temp_dir.into_path().to_str().unwrap().to_string())
-                    .build()
-                    .unwrap()
-                    .build()
-                    .unwrap(),
+                rocksdb_storage,
                 effects_buffer: Default::default(),
+                signal,
+                writer_join_handle,
             }
         }
 
@@ -205,10 +214,19 @@ mod tests {
         pub fn storage(&self) -> &RocksDBStorage {
             &self.rocksdb_storage
         }
+
+        async fn shutdown(self) -> Result<(), anyhow::Error> {
+            self.signal.drain().await;
+            self.writer_join_handle.await??;
+
+            Ok(())
+        }
     }
 
+    type TestResult = Result<(), anyhow::Error>;
+
     #[test(tokio::test)]
-    async fn start_invocation() {
+    async fn start_invocation() -> TestResult {
         let mut state_machine = MockStateMachine::default();
         let fid = mock_start_invocation(&mut state_machine).await;
 
@@ -224,11 +242,13 @@ mod tests {
             pat!(InvocationStatus::Invoked(pat!(InvocationMetadata {
                 invocation_uuid: eq(fid.invocation_uuid)
             })))
-        )
+        );
+
+        state_machine.shutdown().await
     }
 
     #[test(tokio::test)]
-    async fn awakeable_completion_received_before_entry() {
+    async fn awakeable_completion_received_before_entry() -> TestResult {
         let mut state_machine = MockStateMachine::default();
         let fid = mock_start_invocation(&mut state_machine).await;
 
@@ -308,6 +328,8 @@ mod tests {
                 full_invocation_id: eq(fid.clone()),
             }))
         );
+
+        state_machine.shutdown().await
     }
 
     #[test(tokio::test)]
@@ -395,7 +417,7 @@ mod tests {
             some((ge(0), outbox_message_matcher(caller_fid.clone())))
         );
 
-        Ok(())
+        state_machine.shutdown().await
     }
 
     mod virtual_invocation {
@@ -413,7 +435,7 @@ mod tests {
         use restate_types::journal::{AwakeableEntry, Completion, CompletionResult, Entry};
 
         #[test(tokio::test)]
-        async fn create() {
+        async fn create() -> TestResult {
             let mut state_machine = MockStateMachine::default();
 
             // Notification receiving service
@@ -488,10 +510,12 @@ mod tests {
                 .unwrap();
             assert_that!(resolved_service_id, eq(virtual_invocation_service_id));
             assert_that!(resolved_invocation_status, eq(invocation_status));
+
+            state_machine.shutdown().await
         }
 
         #[test(tokio::test)]
-        async fn write_entry_and_notify_completion() {
+        async fn write_entry_and_notify_completion() -> TestResult {
             let mut state_machine = MockStateMachine::default();
 
             // Virtual invocation identifiers
@@ -621,7 +645,9 @@ mod tests {
                         CompletionResult::Success(Bytes::from_static(b"123"))
                     )),
                 })]
-            )
+            );
+
+            state_machine.shutdown().await
         }
     }
 

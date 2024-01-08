@@ -23,9 +23,12 @@ async fn writing_to_rocksdb(base_path: &path::Path) {
         path: base_path.to_str().unwrap().into(),
         ..Default::default()
     };
-    let rocksdb = opts
+    let (rocksdb, writer) = opts
         .build()
         .expect("RocksDB storage creation should succeed");
+
+    let (signal, watch) = drain::channel();
+    let writer_join_handler = writer.run(watch);
 
     //
     // write
@@ -38,6 +41,9 @@ async fn writing_to_rocksdb(base_path: &path::Path) {
         }
         txn.commit().await.unwrap();
     }
+
+    signal.drain().await;
+    writer_join_handler.await.unwrap().unwrap();
 }
 
 fn basic_writing_reading_benchmark(c: &mut Criterion) {

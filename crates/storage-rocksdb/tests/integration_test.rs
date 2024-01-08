@@ -10,10 +10,12 @@
 
 use bytes::Bytes;
 use bytestring::ByteString;
-use restate_storage_api::GetStream;
+use futures::Stream;
+use restate_storage_api::StorageError;
 use restate_types::identifiers::{FullInvocationId, InvocationUuid, ServiceId};
 use restate_types::invocation::{ServiceInvocation, Source, SpanRelation};
 use std::fmt::Debug;
+use std::pin::pin;
 use std::str::FromStr;
 use tempfile::tempdir;
 use tokio_stream::StreamExt;
@@ -27,7 +29,7 @@ mod status_table_test;
 mod timer_table_test;
 
 #[tokio::test]
-async fn test_read_write() {
+async fn test_read_write() -> anyhow::Result<()> {
     //
     // create a rocksdb storage from options
     //
@@ -42,9 +44,12 @@ async fn test_read_write() {
         path,
         ..Default::default()
     };
-    let rocksdb = opts
+    let (rocksdb, writer) = opts
         .build()
         .expect("RocksDB storage creation should succeed");
+
+    let (signal, watch) = drain::channel();
+    let writer_join_handle = writer.run(watch);
 
     //
     // run the tests
@@ -55,6 +60,10 @@ async fn test_read_write() {
     state_table_test::run_tests(rocksdb.clone()).await;
     status_table_test::run_tests(rocksdb.clone()).await;
     timer_table_test::run_tests(rocksdb).await;
+
+    signal.drain().await;
+    writer_join_handle.await??;
+    Ok(())
 }
 
 pub(crate) fn uuid_str(uuid: &str) -> Uuid {
@@ -84,9 +93,10 @@ pub(crate) fn mock_random_service_invocation() -> ServiceInvocation {
 }
 
 pub(crate) async fn assert_stream_eq<T: Send + Debug + PartialEq + 'static>(
-    mut actual: GetStream<'_, T>,
+    actual: impl Stream<Item = Result<T, StorageError>>,
     expected: Vec<T>,
 ) {
+    let mut actual = pin!(actual);
     let mut items = expected.into_iter();
 
     while let Some(item) = actual.next().await {

@@ -4531,7 +4531,6 @@ version = "0.0.1-dev"
 dependencies = [
  "anyhow",
  "arrow 49.0.0",
- "async-trait",
  "bytes",
  "chrono",
  "chrono-humanize",
@@ -4853,7 +4852,6 @@ dependencies = [
 name = "restate-pb"
 version = "0.7.0"
 dependencies = [
- "async-trait",
  "convert_case",
  "once_cell",
  "prost 0.12.3",
@@ -4968,6 +4966,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-panic",
  "vergen",
 ]
 
@@ -5155,8 +5154,10 @@ dependencies = [
  "codederror",
  "criterion",
  "derive_builder",
+ "drain",
  "futures",
  "futures-util",
+ "log",
  "num-bigint",
  "once_cell",
  "paste",
@@ -5168,6 +5169,7 @@ dependencies = [
  "rocksdb",
  "schemars",
  "serde",
+ "sync_wrapper",
  "tempfile",
  "thiserror",
  "tokio",
@@ -5252,6 +5254,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_with",
+ "sync_wrapper",
  "thiserror",
  "tokio",
  "tonic 0.10.2",
@@ -5267,7 +5270,6 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "assert2",
- "async-trait",
  "bincode",
  "bytes",
  "bytestring",
@@ -6514,6 +6516,16 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log 0.1.4",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tracing-panic"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaf80030ce049691c9922d75be63cadf345110a245cd4581833c66f87c02ad25"
+dependencies = [
+ "tracing",
  "tracing-subscriber",
 ]
 

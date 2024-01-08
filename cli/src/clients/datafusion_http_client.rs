@@ -13,6 +13,7 @@
 use super::errors::ApiError;
 use crate::build_info;
 use crate::cli_env::CliEnv;
+use std::time::Duration;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{ArrowPrimitiveType, Int64Type, SchemaRef};
@@ -23,6 +24,7 @@ use bytes::Buf;
 use serde::Serialize;
 use thiserror::Error;
 use tracing::{debug, info};
+use url::Url;
 
 #[derive(Error, Debug)]
 #[error(transparent)]
@@ -31,15 +33,17 @@ pub enum Error {
     #[error("(Protocol error) {0}")]
     Serialization(#[from] serde_json::Error),
     Network(#[from] reqwest::Error),
-    ArrowError(#[from] ArrowError),
-    UrlParseError(#[from] url::ParseError),
+    Arrow(#[from] ArrowError),
+    UrlParse(#[from] url::ParseError),
 }
 
 /// A handy client for the datafusion HTTP service.
 #[derive(Clone)]
 pub struct DataFusionHttpClient {
     pub(crate) inner: reqwest::Client,
-    pub(crate) base_url: reqwest::Url,
+    pub(crate) base_url: Url,
+    pub(crate) bearer_token: Option<String>,
+    pub(crate) request_timeout: Option<Duration>,
 }
 
 impl DataFusionHttpClient {
@@ -52,22 +56,38 @@ impl DataFusionHttpClient {
                 std::env::consts::OS,
                 std::env::consts::ARCH,
             ))
+            .connect_timeout(env.connect_timeout)
             .build()?;
 
         Ok(Self {
             inner: raw_client,
             base_url: env.datafusion_http_base_url.clone(),
+            bearer_token: env.bearer_token.clone(),
+            request_timeout: env.request_timeout,
         })
+    }
+
+    /// Prepare a request builder for a DataFusion request.
+    fn prepare(&self, path: Url) -> reqwest::RequestBuilder {
+        let request_builder = self.inner.request(reqwest::Method::POST, path);
+
+        let request_builder = match self.request_timeout {
+            Some(timeout) => request_builder.timeout(timeout),
+            None => request_builder,
+        };
+
+        match self.bearer_token.as_deref() {
+            Some(token) => request_builder.bearer_auth(token),
+            None => request_builder,
+        }
     }
 
     pub async fn run_query(&self, query: String) -> Result<SqlResponse, Error> {
         let url = self.base_url.join("/api/query")?;
 
         debug!("Sending request sql query '{}'", query);
-        // TODO: Add authentication
         let resp = self
-            .inner
-            .request(reqwest::Method::POST, url)
+            .prepare(url)
             .json(&SqlQueryRequest { query })
             .send()
             .await?;
@@ -105,7 +125,7 @@ impl DataFusionHttpClient {
         let resp = self.run_query(query).await?;
 
         Ok(get_column_as::<Int64Type>(&resp.batches, 0)
-            .get(0)
+            .first()
             .map(|v| **v)
             .unwrap_or(0))
     }
