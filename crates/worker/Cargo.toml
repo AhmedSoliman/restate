@@ -55,6 +55,7 @@ derive_builder = { workspace = true }
 drain = { workspace = true }
 futures = { workspace = true }
 humantime = { workspace = true }
+metrics =  { workspace = true }
 opentelemetry_api = { workspace = true }
 pin-project = { workspace = true }
 prost = { workspace = true }

@@ -18,6 +18,7 @@ use futures::{FutureExt, TryFutureExt};
 use http::{Request, Response, StatusCode};
 use http_body::Body;
 use hyper::Body as HyperBody;
+use metrics::histogram;
 use opentelemetry::trace::{SpanContext, TraceContextExt};
 use prost::Message;
 use restate_ingress_dispatcher::{IdempotencyMode, IngressRequest, IngressRequestSender};
@@ -31,7 +32,7 @@ use restate_types::errors::InvocationError;
 use restate_types::invocation::SpanRelation;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tonic::metadata::MetadataKey;
 use tonic_web::{GrpcWebLayer, GrpcWebService};
@@ -200,6 +201,8 @@ where
 
         let client_connect_info = req.extensions().get::<ConnectInfo>().cloned();
 
+        let start_time = Instant::now();
+
         let ingress_request_handler = move |handler_request: HandlerRequest| {
             let (req_headers, req_payload) = handler_request;
 
@@ -292,6 +295,10 @@ where
                         err => Status::internal(err.to_string())
                     })?;
 
+                // Note that we only record (mostly) successful requests here. We might want to
+                // change this in the _near_ future.
+                let latency_metric = histogram!("ingress.duration_seconds", "service_name" => service_name.clone(), "service_method" => method_name.clone());
+
                 let fid = FullInvocationId::generate(service_name, key);
                 let span_relation = SpanRelation::Parent(ingress_span_context);
 
@@ -328,6 +335,8 @@ where
                     );
                 }
 
+
+                        latency_metric.record(start_time.elapsed());
                 match response.into() {
                     Ok(response_payload) => {
                         trace!(rpc.response = ?response_payload, "Complete external gRPC request successfully");
