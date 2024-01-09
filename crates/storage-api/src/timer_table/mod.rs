@@ -8,24 +8,50 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use crate::timer_table::Timer::CompleteSleepEntry;
 use crate::Result;
 use futures_util::Stream;
-use restate_types::identifiers::FullInvocationId;
 use restate_types::identifiers::PartitionId;
+use restate_types::identifiers::{InvocationUuid, ServiceId};
 use restate_types::invocation::ServiceInvocation;
+use std::cmp::Ordering;
 use std::future::Future;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TimerKey {
-    pub full_invocation_id: FullInvocationId,
-    pub journal_index: u32,
     pub timestamp: u64,
+    pub invocation_uuid: InvocationUuid,
+    pub journal_index: u32,
+}
+
+impl PartialOrd for TimerKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.invocation_uuid.cmp(&other.invocation_uuid))
+            .then_with(|| self.journal_index.cmp(&other.journal_index))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Timer {
-    CompleteSleepEntry,
-    Invoke(ServiceInvocation),
+    CompleteSleepEntry(ServiceId),
+    Invoke(ServiceId, ServiceInvocation),
+}
+
+impl Timer {
+    pub fn service_id(&self) -> &ServiceId {
+        match self {
+            CompleteSleepEntry(service_id) => service_id,
+            Timer::Invoke(service_id, _) => service_id,
+        }
+    }
 }
 
 pub trait TimerTable {

@@ -14,24 +14,19 @@ use crate::RocksDBTransaction;
 use crate::TableKind::Timers;
 use crate::TableScanIterationDecision::Emit;
 use crate::{TableScan, TableScanIterationDecision};
-use bytes::Bytes;
-use bytestring::ByteString;
 use futures::Stream;
 use prost::Message;
 use restate_storage_api::timer_table::{Timer, TimerKey, TimerTable};
 use restate_storage_api::{Result, StorageError};
 use restate_storage_proto::storage;
-use restate_types::identifiers::PartitionId;
-use uuid::Uuid;
+use restate_types::identifiers::{InvocationUuid, PartitionId};
 
 define_table_key!(
     Timers,
     TimersKey(
         partition_id: PartitionId,
         timestamp: u64,
-        service_name: ByteString,
-        service_key: Bytes,
-        invocation_id: Bytes,
+        invocation_id: InvocationUuid,
         journal_index: u32
     )
 );
@@ -41,17 +36,34 @@ fn write_timer_key(partition_id: PartitionId, timer_key: &TimerKey) -> TimersKey
     TimersKey::default()
         .partition_id(partition_id)
         .timestamp(timer_key.timestamp)
-        .service_name(timer_key.full_invocation_id.service_id.service_name.clone())
-        .service_key(timer_key.full_invocation_id.service_id.key.clone())
-        .invocation_id(
-            timer_key // TODO: fix this
-                .full_invocation_id
-                .invocation_uuid
-                .as_ref()
-                .to_vec()
-                .into(),
-        )
+        .invocation_id(timer_key.invocation_uuid)
         .journal_index(timer_key.journal_index)
+}
+
+#[inline]
+fn timer_key_from_key_slice(slice: &[u8]) -> Result<TimerKey> {
+    let mut buf = std::io::Cursor::new(slice);
+    let key = TimersKey::deserialize_from(&mut buf)?;
+    if !key.is_complete() {
+        return Err(StorageError::DataIntegrityError);
+    }
+    let timer_key = TimerKey {
+        invocation_uuid: key.invocation_id.unwrap(),
+        journal_index: key.journal_index.unwrap(),
+        timestamp: key.timestamp.unwrap(),
+    };
+
+    Ok(timer_key)
+}
+
+fn decode_seq_timer_key_value(k: &[u8], v: &[u8]) -> Result<(TimerKey, Timer)> {
+    let timer_key = timer_key_from_key_slice(k)?;
+
+    let timer = Timer::try_from(
+        storage::v1::Timer::decode(v).map_err(|error| StorageError::Generic(error.into()))?,
+    )?;
+
+    Ok((timer_key, timer))
 }
 
 #[inline]
@@ -74,28 +86,6 @@ fn exclusive_start_key_range(
     } else {
         TableScan::Partition(partition_id)
     }
-}
-
-#[inline]
-fn timer_key_from_key_slice(slice: &[u8]) -> Result<TimerKey> {
-    let mut key = Bytes::copy_from_slice(slice);
-    let key = TimersKey::deserialize_from(&mut key)?;
-    if !key.is_complete() {
-        return Err(StorageError::DataIntegrityError);
-    }
-    let invocation_uuid = Uuid::from_slice(key.invocation_id_ok_or()?.as_ref())
-        .map_err(|error| StorageError::Generic(error.into()))?;
-    let timer_key = TimerKey {
-        full_invocation_id: restate_types::identifiers::FullInvocationId::new(
-            key.service_name.unwrap(),
-            key.service_key.unwrap(),
-            invocation_uuid,
-        ),
-        journal_index: key.journal_index.unwrap(),
-        timestamp: key.timestamp.unwrap(),
-    };
-
-    Ok(timer_key)
 }
 
 impl<'a> TimerTable for RocksDBTransaction<'a> {
@@ -131,27 +121,19 @@ impl<'a> TimerTable for RocksDBTransaction<'a> {
     }
 }
 
-fn decode_seq_timer_key_value(k: &[u8], v: &[u8]) -> Result<(TimerKey, Timer)> {
-    let timer_key = timer_key_from_key_slice(k)?;
-
-    let timer = Timer::try_from(
-        storage::v1::Timer::decode(v).map_err(|error| StorageError::Generic(error.into()))?,
-    )?;
-
-    Ok((timer_key, timer))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use restate_types::identifiers::FullInvocationId;
+    use crate::timer_table::TimerKey;
+    use rand::Rng;
+    use restate_types::identifiers::InvocationUuid;
+    use uuid::Uuid;
 
     #[test]
     fn round_trip() {
         let uuid = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2c").expect("invalid uuid");
         let key = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
+            invocation_uuid: uuid.into(),
             journal_index: 1448,
             timestamp: 87654321,
         };
@@ -167,118 +149,14 @@ mod tests {
         let uuid = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2c").expect("invalid uuid");
 
         let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
+            invocation_uuid: uuid.into(),
             journal_index: 0,
             timestamp: 300,
         };
         let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
+            invocation_uuid: uuid.into(),
             journal_index: 0,
             timestamp: 301,
-        };
-        assert_in_range(a, b);
-    }
-
-    #[test]
-    fn test_lexicographical_sorting_by_svc() {
-        let uuid = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2c").expect("invalid uuid");
-        let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-2", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        assert_in_range(a, b);
-        //
-        // same timestamp and svc, different key
-        //
-        let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-2", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        assert_in_range(a, b);
-        //
-        // same timestamp, svc, key, but different invocation
-        //
-        let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        let uuid2 = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2d").expect("invalid uuid");
-        let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid2),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        assert_in_range(a, b);
-        //
-        // same everything but journal index
-        //
-        let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 1,
-            timestamp: 300,
-        };
-        assert_in_range(a, b);
-    }
-
-    #[test]
-    fn test_lexicographical_sorting_by_svc_keys() {
-        let uuid = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2c").expect("invalid uuid");
-        let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-2", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        assert_in_range(a, b);
-        //
-        // same timestamp, svc, key, but different invocation
-        //
-        let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        let uuid2 = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2d").expect("invalid uuid");
-        let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid2),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        assert_in_range(a, b);
-        //
-        // same everything but journal index
-        //
-        let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 0,
-            timestamp: 300,
-        };
-        let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
-            journal_index: 1,
-            timestamp: 300,
         };
         assert_in_range(a, b);
     }
@@ -287,13 +165,13 @@ mod tests {
     fn test_lexicographical_sorting_by_invocation() {
         let uuid = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2c").expect("invalid uuid");
         let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
+            invocation_uuid: uuid.into(),
             journal_index: 0,
             timestamp: 300,
         };
         let uuid2 = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2d").expect("invalid uuid");
         let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid2),
+            invocation_uuid: uuid2.into(),
             journal_index: 0,
             timestamp: 300,
         };
@@ -304,12 +182,12 @@ mod tests {
     fn test_lexicographical_sorting_by_journal_index() {
         let uuid = Uuid::try_parse("018756fa-3f7f-7854-a76b-42c59a3d7f2c").expect("invalid uuid");
         let a = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
+            invocation_uuid: uuid.into(),
             journal_index: 0,
             timestamp: 300,
         };
         let b = TimerKey {
-            full_invocation_id: FullInvocationId::new("svc-1", "key-1", uuid),
+            invocation_uuid: uuid.into(),
             journal_index: 1,
             timestamp: 300,
         };
@@ -340,5 +218,34 @@ mod tests {
 
     fn less_than_or_equal(a: impl AsRef<[u8]>, b: impl AsRef<[u8]>) -> bool {
         a.as_ref() <= b.as_ref()
+    }
+
+    #[test]
+    fn timer_key_order_is_the_same_as_binary_order() {
+        let mut timer_keys: Vec<_> = (0..100).map(|idx| (idx, random_timer_key())).collect();
+        let mut binary_timer_keys: Vec<_> = timer_keys
+            .iter()
+            .map(|(idx, key)| (*idx, write_timer_key(1, key).serialize()))
+            .collect();
+
+        timer_keys.sort_by(|(_, key), (_, other_key)| key.cmp(other_key));
+        binary_timer_keys.sort_by(|(_, key), (_, other_key)| key.cmp(other_key));
+
+        let timer_keys_sort_order: Vec<_> = timer_keys.iter().map(|(idx, _)| *idx).collect();
+        let binary_timer_keys_sort_order: Vec<_> =
+            binary_timer_keys.iter().map(|(idx, _)| *idx).collect();
+
+        assert_eq!(
+            timer_keys_sort_order, binary_timer_keys_sort_order,
+            "In-memory and binary order need to be equal. Failing timers: {timer_keys:?}"
+        );
+    }
+
+    pub fn random_timer_key() -> TimerKey {
+        TimerKey {
+            invocation_uuid: InvocationUuid::now_v7(),
+            journal_index: rand::thread_rng().gen_range(0..2 ^ 16),
+            timestamp: rand::thread_rng().gen_range(0..2 ^ 16),
+        }
     }
 }

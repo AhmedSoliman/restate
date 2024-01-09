@@ -10,10 +10,13 @@
 
 use crate::partition::action_effect_handler::ActionEffectHandler;
 use crate::partition::leadership::{ActionEffect, LeadershipState, TaskResult};
-use crate::partition::state_machine::{Effects, StateMachine};
-use crate::partition::storage::PartitionStorage;
+use crate::partition::state_machine::{
+    AckCommand, ActionCollector, DeduplicatingStateMachine, Effects, InterpretationResult,
+};
+use crate::partition::storage::{PartitionStorage, Transaction};
 use crate::util::IdentitySender;
 use futures::StreamExt;
+use metrics::{counter, histogram};
 use restate_schema_impl::Schemas;
 use restate_storage_rocksdb::RocksDBStorage;
 use restate_types::identifiers::{PartitionId, PartitionKey, PeerId};
@@ -147,10 +150,17 @@ where
 
         loop {
             tokio::select! {
-                command = command_rx.recv() => {
-                    if let Some(command) = command {
+                mut next_command = command_rx.recv() => {
+                    if next_command.is_none() {
+                        break;
+                    }
+
+                    while let Some(command) = next_command.take() {
                         match command {
-                            restate_consensus::Command::Apply(ackable_command) => {
+                            restate_consensus::Command::Apply(command) => {
+                                let start = std::time::Instant::now();
+                                counter!("partition.handle_command.total", "partition_id" => partition_id.to_string(), "command" => command.type_human()).increment(1);
+                                let latency = histogram!("partition.handle_command_duration.seconds", "partition_id" => partition_id.to_string(), "command" => command.type_human());
                                 // Clear the effects to reuse the vector
                                 effects.clear();
 
@@ -161,12 +171,22 @@ where
                                 let is_leader = leadership_state.is_leader();
                                 let message_collector = leadership_state.into_message_collector();
 
-                                // Tick state machine
-                                let tick_result = state_machine.apply(ackable_command, &mut effects, transaction, message_collector, is_leader).await?;
+                                let (application_result, command) = Self::apply_command(
+                                    &mut state_machine,
+                                    command,
+                                    &mut effects,
+                                    transaction,
+                                    message_collector,
+                                    is_leader,
+                                    &mut command_rx)
+                                .await?;
+
+                                next_command = command;
 
                                 // Commit actuator messages
-                                let message_collector = tick_result.commit().await?;
+                                let message_collector = application_result.commit().await?;
                                 leadership_state = message_collector.send().await?;
+                                latency.record(start.elapsed());
                             }
                             restate_consensus::Command::BecomeLeader(leader_epoch) => {
                                 debug!(restate.partition.peer = %peer_id, restate.partition.id = %partition_id, restate.partition.leader_epoch = %leader_epoch, "Become leader");
@@ -191,8 +211,6 @@ where
                                 unimplemented!("Not supported yet.");
                             }
                         }
-                    } else {
-                        break;
                     }
                 },
                 actuator_output = actuator_stream.next() => {
@@ -202,6 +220,7 @@ where
                 task_result = leadership_state.run_tasks() => {
                     match task_result {
                         TaskResult::Timer(timer) => {
+                            counter!("partition.timer_due_handled.total", "partition_id" => partition_id.to_string()).increment(1);
                             actuator_output_handler.handle(ActionEffect::Timer(timer)).await;
                         },
                         TaskResult::TerminatedTask(result) => {
@@ -211,7 +230,6 @@ where
                 },
             }
         }
-
         debug!(%peer_id, %partition_id, "Shutting partition processor down.");
         let _ = leadership_state.become_follower().await;
 
@@ -220,7 +238,7 @@ where
 
     async fn create_state_machine<Codec, Storage>(
         partition_storage: &PartitionStorage<Storage>,
-    ) -> Result<StateMachine<Codec>, restate_storage_api::StorageError>
+    ) -> Result<DeduplicatingStateMachine<Codec>, restate_storage_api::StorageError>
     where
         Codec: restate_types::journal::raw::RawEntryCodec + Default + Debug,
         Storage: restate_storage_api::Storage,
@@ -230,9 +248,46 @@ where
         let outbox_seq_number = transaction.load_outbox_seq_number().await?;
         transaction.commit().await?;
 
-        let state_machine = StateMachine::new(inbox_seq_number, outbox_seq_number);
+        let state_machine = DeduplicatingStateMachine::new(inbox_seq_number, outbox_seq_number);
 
         Ok(state_machine)
+    }
+
+    pub async fn apply_command<
+        TransactionType: restate_storage_api::Transaction + Send,
+        Collector: ActionCollector,
+    >(
+        state_machine: &mut DeduplicatingStateMachine<RawEntryCodec>,
+        command: AckCommand,
+        effects: &mut Effects,
+        transaction: Transaction<TransactionType>,
+        message_collector: Collector,
+        is_leader: bool,
+        command_rx: &mut mpsc::Receiver<restate_consensus::Command<AckCommand>>,
+    ) -> Result<
+        (
+            InterpretationResult<Transaction<TransactionType>, Collector>,
+            Option<restate_consensus::Command<AckCommand>>,
+        ),
+        state_machine::Error,
+    > {
+        // Apply state machine
+        let mut application_result = state_machine
+            .apply(command, effects, transaction, message_collector, is_leader)
+            .await?;
+
+        while let Ok(command) = command_rx.try_recv() {
+            if let restate_consensus::Command::Apply(command) = command {
+                let (transaction, message_collector) = application_result.into_inner();
+                application_result = state_machine
+                    .apply(command, effects, transaction, message_collector, is_leader)
+                    .await?;
+            } else {
+                return Ok((application_result, Some(command)));
+            }
+        }
+
+        Ok((application_result, None))
     }
 }
 

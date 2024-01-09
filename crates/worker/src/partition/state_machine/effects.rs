@@ -19,13 +19,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::vec::Drain;
 use tracing::{debug_span, event_enabled, span_enabled, trace, trace_span, Level};
-use types::TimerKeyDisplay;
 
-use crate::partition::state_machine::commands::AckResponse;
-use crate::partition::{types, TimerValue};
+use crate::partition::types::TimerKeyDisplay;
+use crate::partition::TimerValue;
 use restate_storage_api::outbox_table::OutboxMessage;
 use restate_storage_api::status_table::InvocationMetadata;
-use restate_storage_api::timer_table::Timer;
+use restate_storage_api::timer_table::{Timer, TimerKey};
 use restate_types::errors::InvocationErrorCode;
 use restate_types::identifiers::{
     DeploymentId, EntryIndex, FullInvocationId, InvocationId, InvocationUuid, ServiceId,
@@ -97,11 +96,7 @@ pub(crate) enum Effect {
         timer_value: TimerValue,
         span_context: ServiceInvocationSpanContext,
     },
-    DeleteTimer {
-        full_invocation_id: FullInvocationId,
-        wake_up_time: MillisSinceEpoch,
-        entry_index: EntryIndex,
-    },
+    DeleteTimer(TimerKey),
 
     // Journal operations
     StoreDeploymentId {
@@ -163,9 +158,6 @@ pub(crate) enum Effect {
         span_context: ServiceInvocationSpanContext,
         result: Result<(), (InvocationErrorCode, String)>,
     },
-
-    // Acks
-    SendAckResponse(AckResponse),
 
     // Invoker commands
     AbortInvocation(FullInvocationId),
@@ -430,51 +422,49 @@ impl Effect {
                 timer_value,
                 span_context,
                 ..
-            } => match &timer_value.value {
-                Timer::CompleteSleepEntry => {
+            } => match timer_value.value() {
+                Timer::CompleteSleepEntry(service_id) => {
                     info_span_if_leader!(
                         is_leader,
                         span_context.is_sampled(),
                         span_context.as_parent(),
                         "sleep",
-                        rpc.service = %timer_value.full_invocation_id.service_id.service_name,
-                        restate.invocation.id = %timer_value.full_invocation_id,
-                        restate.timer.key = %timer_value.display_key(),
-                        restate.timer.wake_up_time = %timer_value.wake_up_time,
+                        rpc.service = %service_id.service_name,
+                        restate.invocation.id = %timer_value.invocation_id(),
+                        restate.timer.key = %TimerKeyDisplay(timer_value.key()),
+                        restate.timer.wake_up_time = %timer_value.wake_up_time(),
                         // without converting to i64 this field will encode as a string
                         // however, overflowing i64 seems unlikely
-                        restate.internal.end_time = i64::try_from(timer_value.wake_up_time.as_u64()).expect("wake up time should fit into i64"),
+                        restate.internal.end_time = i64::try_from(timer_value.wake_up_time().as_u64()).expect("wake up time should fit into i64"),
                     );
 
                     debug_if_leader!(
                         is_leader,
-                        restate.timer.key = %timer_value.display_key(),
-                        restate.timer.wake_up_time = %timer_value.wake_up_time,
+                        restate.timer.key = %TimerKeyDisplay(timer_value.key()),
+                        restate.timer.wake_up_time = %timer_value.wake_up_time(),
                         "Effect: Register Sleep timer"
                     )
                 }
-                Timer::Invoke(service_invocation) => {
+                Timer::Invoke(_, service_invocation) => {
                     // no span necessary; there will already be a background_invoke span
                     debug_if_leader!(
                         is_leader,
                         rpc.service = %service_invocation.fid.service_id.service_name,
                         restate.invocation.id = %service_invocation.fid,
-                        restate.timer.key = %timer_value.display_key(),
-                        restate.timer.wake_up_time = %timer_value.wake_up_time,
+                        restate.timer.key = %TimerKeyDisplay(timer_value.key()),
+                        restate.timer.wake_up_time = %timer_value.wake_up_time(),
                         "Effect: Register background invoke timer"
                     )
                 }
             },
-            Effect::DeleteTimer {
-                full_invocation_id,
-                entry_index,
-                wake_up_time,
-            } => debug_if_leader!(
-                is_leader,
-                restate.timer.key = %TimerKeyDisplay(full_invocation_id, entry_index),
-                restate.timer.wake_up_time = %wake_up_time,
-                "Effect: Delete timer"
-            ),
+            Effect::DeleteTimer(timer_key) => {
+                let timer_key_display = TimerKeyDisplay(timer_key);
+                debug_if_leader!(
+                    is_leader,
+                    restate.timer.key = %timer_key_display,
+                    "Effect: Delete timer"
+                )
+            }
             Effect::StoreDeploymentId { deployment_id, .. } => debug_if_leader!(
                 is_leader,
                 restate.deployment.id = %deployment_id,
@@ -626,11 +616,6 @@ impl Effect {
                 );
                 // No need to log this
             }
-            Effect::SendAckResponse(ack_response) => {
-                if is_leader {
-                    trace!("Effect: Sending ack response: {ack_response:?}");
-                }
-            }
             Effect::AbortInvocation(_) => {
                 debug_if_leader!(is_leader, "Effect: Abort unknown invocation");
             }
@@ -781,17 +766,8 @@ impl Effects {
         })
     }
 
-    pub(crate) fn delete_timer(
-        &mut self,
-        wake_up_time: MillisSinceEpoch,
-        full_invocation_id: FullInvocationId,
-        entry_index: EntryIndex,
-    ) {
-        self.effects.push(Effect::DeleteTimer {
-            full_invocation_id,
-            wake_up_time,
-            entry_index,
-        });
+    pub(crate) fn delete_timer(&mut self, timer_key: TimerKey) {
+        self.effects.push(Effect::DeleteTimer(timer_key));
     }
 
     pub(crate) fn store_chosen_deployment(
@@ -939,10 +915,6 @@ impl Effects {
             span_context,
             result,
         })
-    }
-
-    pub(crate) fn send_ack_response(&mut self, ack_response: AckResponse) {
-        self.effects.push(Effect::SendAckResponse(ack_response));
     }
 
     pub(crate) fn abort_invocation(&mut self, full_invocation_id: FullInvocationId) {
