@@ -16,6 +16,7 @@ use crate::partition::state_machine::{
 use crate::partition::storage::{PartitionStorage, Transaction};
 use crate::util::IdentitySender;
 use futures::StreamExt;
+use metrics::{counter, histogram};
 use restate_schema_impl::Schemas;
 use restate_storage_rocksdb::RocksDBStorage;
 use restate_types::identifiers::{PartitionId, PartitionKey, PeerId};
@@ -157,6 +158,9 @@ where
                     while let Some(command) = next_command.take() {
                         match command {
                             restate_consensus::Command::Apply(command) => {
+                                let start = std::time::Instant::now();
+                                counter!("partition.handle_command.total", "partition_id" => partition_id.to_string(), "command" => command.type_human()).increment(1);
+                                let latency = histogram!("partition.handle_command_duration.seconds", "partition_id" => partition_id.to_string(), "command" => command.type_human());
                                 // Clear the effects to reuse the vector
                                 effects.clear();
 
@@ -182,6 +186,7 @@ where
                                 // Commit actuator messages
                                 let message_collector = application_result.commit().await?;
                                 leadership_state = message_collector.send().await?;
+                                latency.record(start.elapsed());
                             }
                             restate_consensus::Command::BecomeLeader(leader_epoch) => {
                                 debug!(restate.partition.peer = %peer_id, restate.partition.id = %partition_id, restate.partition.leader_epoch = %leader_epoch, "Become leader");
@@ -215,6 +220,7 @@ where
                 task_result = leadership_state.run_tasks() => {
                     match task_result {
                         TaskResult::Timer(timer) => {
+                            counter!("partition.timer_due_handled.total", "partition_id" => partition_id.to_string()).increment(1);
                             actuator_output_handler.handle(ActionEffect::Timer(timer)).await;
                         },
                         TaskResult::TerminatedTask(result) => {

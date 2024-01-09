@@ -10,6 +10,7 @@
 
 use codederror::CodedError;
 use restate_meta::Meta;
+use restate_node_admin::service::NodeAdminService;
 use restate_worker::Worker;
 
 #[derive(Debug, thiserror::Error, CodedError)]
@@ -26,12 +27,21 @@ pub enum ApplicationError {
         #[code]
         restate_worker::Error,
     ),
+    #[error("node admin service failed: {0}")]
+    NodeAdminService(
+        #[from]
+        #[code]
+        restate_node_admin::Error,
+    ),
     #[error("meta panicked: {0}")]
     #[code(unknown)]
     MetaPanic(tokio::task::JoinError),
     #[error("worker panicked: {0}")]
     #[code(unknown)]
     WorkerPanic(tokio::task::JoinError),
+    #[error("node admin service panicked: {0}")]
+    #[code(unknown)]
+    NodeAdminPanic(tokio::task::JoinError),
 }
 
 #[derive(Debug, thiserror::Error, CodedError)]
@@ -43,23 +53,33 @@ pub struct BuildError {
 }
 
 pub struct Application {
+    node_admin: NodeAdminService,
     meta: Meta,
     worker: Worker,
 }
 
 impl Application {
     pub fn new(
+        node_admin: restate_node_admin::Options,
         meta: restate_meta::Options,
         worker: restate_worker::Options,
     ) -> Result<Self, BuildError> {
         let meta = meta.build();
         let worker = worker.build(meta.schemas())?;
 
-        Ok(Self { meta, worker })
+        let node_admin = node_admin.build();
+
+        Ok(Self {
+            node_admin,
+            meta,
+            worker,
+        })
     }
 
     pub async fn run(mut self, drain: drain::Watch) -> Result<(), ApplicationError> {
         let (shutdown_signal, shutdown_watch) = drain::channel();
+        // start node admin service base
+        let mut node_admin_handle = tokio::spawn(self.node_admin.run(shutdown_watch.clone()));
 
         // Init the meta. This will reload the schemas in memory.
         self.meta.init().await?;
@@ -74,7 +94,7 @@ impl Application {
 
         tokio::select! {
             _ = shutdown => {
-                let _ = tokio::join!(shutdown_signal.drain(), meta_handle, worker_handle);
+                let _ = tokio::join!(shutdown_signal.drain(), meta_handle, worker_handle, node_admin_handle);
             },
             result = &mut meta_handle => {
                 result.map_err(ApplicationError::MetaPanic)??;
@@ -84,6 +104,10 @@ impl Application {
                 result.map_err(ApplicationError::WorkerPanic)??;
                 panic!("Unexpected termination of worker.");
             }
+            result = &mut node_admin_handle => {
+                result.map_err(ApplicationError::NodeAdminPanic)??;
+                panic!("Unexpected termination of node admin service.");
+            },
         }
 
         Ok(())
