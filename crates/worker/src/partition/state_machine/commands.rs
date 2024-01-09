@@ -57,6 +57,10 @@ impl AckCommand {
     pub fn into_inner(self) -> (Command, AckMode) {
         (self.cmd, self.ack_mode)
     }
+
+    pub fn type_human(&self) -> &'static str {
+        self.cmd.type_human()
+    }
 }
 
 #[derive(Debug)]
@@ -209,4 +213,18 @@ pub enum Command {
     Invocation(ServiceInvocation),
     Response(InvocationResponse),
     BuiltInInvoker(NBISEffects),
+}
+
+impl Command {
+    fn type_human(&self) -> &'static str {
+        match self {
+            Command::TerminateInvocation(_) => "InvocationTermination",
+            Command::Invoker(_) => "InvokerEffect",
+            Command::Timer(_) => "TimerValue",
+            Command::OutboxTruncation(_) => "OutboxTruncation",
+            Command::Invocation(_) => "ServiceInvocation",
+            Command::Response(_) => "InvocationResponse",
+            Command::BuiltInInvoker(_) => "NBISEffects",
+        }
+    }
 }
