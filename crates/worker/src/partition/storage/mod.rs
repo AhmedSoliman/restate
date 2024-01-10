@@ -8,12 +8,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use crate::metric_definitions::{PARTITION_STORAGE_TX_COMMITTED, PARTITION_STORAGE_TX_CREATED};
 use crate::partition::shuffle::{OutboxReader, OutboxReaderError};
 use crate::partition::types::TimerKeyWrapper;
 use crate::partition::{CommitError, Committable, TimerValue};
 use bytes::{Buf, Bytes};
 use futures::stream::BoxStream;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use metrics::counter;
 use restate_storage_api::deduplication_table::SequenceNumberSource;
 use restate_storage_api::inbox_table::InboxEntry;
 use restate_storage_api::journal_table::JournalEntry;
@@ -60,6 +62,7 @@ where
     }
 
     pub(super) fn create_transaction(&self) -> Transaction<Storage::TransactionType<'_>> {
+        counter!(PARTITION_STORAGE_TX_CREATED).increment(1);
         Transaction::new(
             self.partition_id,
             self.partition_key_range.clone(),
@@ -101,8 +104,10 @@ where
         }
     }
 
-    pub(super) fn commit(self) -> impl Future<Output = Result<(), StorageError>> + Send {
-        self.inner.commit()
+    pub(super) async fn commit(self) -> Result<(), StorageError> {
+        let res = self.inner.commit().await;
+        counter!(PARTITION_STORAGE_TX_COMMITTED).increment(1);
+        res
     }
 
     pub(super) fn scan_invoked_invocations(

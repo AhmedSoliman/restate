@@ -11,11 +11,13 @@
 use super::{Effects, Error};
 use std::future::Future;
 
+use crate::metric_definitions::PARTITION_STORAGE_TX_COMMITTED;
 use crate::partition::services::non_deterministic;
 use crate::partition::state_machine::actions::Action;
 use crate::partition::state_machine::effects::Effect;
 use crate::partition::{CommitError, Committable};
 use bytes::Bytes;
+use metrics::counter;
 use restate_invoker_api::InvokeInputJournal;
 use restate_storage_api::outbox_table::OutboxMessage;
 use restate_storage_api::status_table::{
@@ -167,6 +169,7 @@ where
         let Self { txn, collector } = self;
 
         txn.commit().await?;
+        counter!(PARTITION_STORAGE_TX_COMMITTED).increment(1);
         Ok(collector)
     }
 
