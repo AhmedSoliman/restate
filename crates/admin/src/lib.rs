@@ -10,9 +10,10 @@
 
 mod error;
 mod options;
-mod query;
+mod rest_api;
 pub mod service;
 mod state;
+mod storage_query;
 
 pub use crate::options::{Options, OptionsBuilder, OptionsBuilderError};
-pub use service::Error;
+pub use error::Error;

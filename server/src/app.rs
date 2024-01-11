@@ -9,14 +9,21 @@
 // by the Apache License, Version 2.0.
 
 use codederror::CodedError;
-use restate_meta::Meta;
+use restate_admin::service::AdminService;
+use restate_meta::{FileMetaStorage, MetaService};
 use restate_node_ctrl::service::NodeCtrlService;
 use restate_worker::Worker;
 
 #[derive(Debug, thiserror::Error, CodedError)]
 pub enum ApplicationError {
+    #[error("admin service failed: {0}")]
+    AdminService(
+        #[from]
+        #[code]
+        restate_admin::Error,
+    ),
     #[error("meta failed: {0}")]
-    Meta(
+    MetaService(
         #[from]
         #[code]
         restate_meta::Error,
@@ -54,7 +61,8 @@ pub struct BuildError {
 
 pub struct Application {
     node_ctrl: NodeCtrlService,
-    meta: Meta,
+    meta: MetaService<FileMetaStorage>,
+    admin: AdminService,
     worker: Worker,
 }
 
@@ -63,14 +71,19 @@ impl Application {
         node_ctrl: restate_node_ctrl::Options,
         meta: restate_meta::Options,
         worker: restate_worker::Options,
+        admin: restate_admin::Options,
     ) -> Result<Self, BuildError> {
         let meta = meta.build();
+        // create cluster admin server
+        let admin = admin.build(meta.schemas(), meta.meta_handle());
+        // create worker service
         let worker = worker.build(meta.schemas())?;
 
         let node_ctrl = node_ctrl.build();
 
         Ok(Self {
             node_ctrl,
+            admin,
             meta,
             worker,
         })
@@ -80,14 +93,14 @@ impl Application {
         let (shutdown_signal, shutdown_watch) = drain::channel();
         // start node ctrl service base
         let mut node_ctrl_handle = tokio::spawn(self.node_ctrl.run(shutdown_watch.clone()));
-
         // Init the meta. This will reload the schemas in memory.
         self.meta.init().await?;
-
         let worker_command_tx = self.worker.worker_command_tx();
         let mut meta_handle =
             tokio::spawn(self.meta.run(shutdown_watch.clone(), worker_command_tx));
-        let mut worker_handle = tokio::spawn(self.worker.run(shutdown_watch));
+        // Ideally we should not pass the AdminServer to worker since it's a separate role,
+        // but we have to do that until we allow worker storage state to be queried externally/remotely.
+        let mut worker_handle = tokio::spawn(self.worker.run(shutdown_watch, self.admin));
 
         let shutdown = drain.signaled();
         tokio::pin!(shutdown);
